@@ -1501,7 +1501,7 @@ function desktopDetailSignature(sessionID, detail) {
 // watcher only sees the foreground composer, so each observed running turn is
 // tracked here and settled from the session DB, which records every session
 // regardless of which conversation is foreground.
-const desktopRunWatch = createDesktopRunWatch({ readRowsAfter });
+const desktopRunWatch = createDesktopRunWatch({ readRowsAfter: readMessagesAfter });
 
 function desktopRunWatchStart(sessionID) {
   void (async () => {
