@@ -18,6 +18,7 @@ const {
 const { createHermesNativeRuntime } = require("./hermes_native");
 const { createHermesTuiRelay, launchManagedHermesTui } = require("./hermes_tui_relay");
 const { desktopDirectoryRows, nativeDirectoryRows, nativeDirectoryTitle } = require("./hermes_session_directory");
+const { createDesktopRunWatch } = require("./hermes_desktop_run_watch");
 const {
   currentReasoningFromConfig,
   modelOptionID,
@@ -1496,6 +1497,70 @@ function desktopDetailSignature(sessionID, detail) {
   return JSON.stringify([sessionID, stableDetail]);
 }
 
+// Desktop-initiated runs finish without the Hub's forward-run waiter. The
+// watcher only sees the foreground composer, so each observed running turn is
+// tracked here and settled from the session DB, which records every session
+// regardless of which conversation is foreground.
+const desktopRunWatch = createDesktopRunWatch({ readRowsAfter });
+
+function desktopRunWatchStart(sessionID) {
+  void (async () => {
+    let baselineID = 0;
+    try {
+      const rows = await queryJSON(
+        `SELECT COALESCE(MAX(id), 0) AS max_id FROM messages WHERE session_id = '${escapeSQLite(sessionID)}';`);
+      baselineID = Math.max(0, asNumber(rows && rows[0] && rows[0].max_id));
+    } catch {
+      baselineID = 0;
+    }
+    desktopRunWatch.start(sessionID, baselineID);
+  })();
+}
+
+function desktopTerminalRunSummary(status, latest) {
+  if (status === "interrupted") return "Hermes 任务已被打断。";
+  if (status === "failed") return firstNonEmpty(latest, "Hermes 执行失败。");
+  return firstNonEmpty(latest, "Hermes 已完成。");
+}
+
+async function buildDesktopTerminalRunEvent(sessionID, status, evidence, rows) {
+  let row = null;
+  try {
+    row = await findSessionByID(sessionID);
+  } catch {}
+  const session = toSession(sessionID, firstNonEmpty(row && row.cwd), firstNonEmpty(row && row.title));
+  return {
+    ID: `hermes:desktop-run:${sessionID}:${evidence}`,
+    Type: `run.${status}`,
+    Status: status,
+    Summary: desktopTerminalRunSummary(status, latestAssistantSummary(rows)),
+    CreatedAt: nowISO(),
+    Payload: {
+      desktop_live: true,
+      native_session: {
+        plugin_id: "hermes",
+        native_session_id: sessionID,
+        native_thread_id: sessionID,
+        surface: session.Surface,
+        endpoint: session.Endpoint,
+        cwd: session.Cwd,
+      },
+      session_hint: desktopSessionHint(session, null),
+    },
+  };
+}
+
+async function drainDesktopTerminalEvents() {
+  const settled = await desktopRunWatch.drain();
+  const events = [];
+  for (const item of settled) {
+    try {
+      events.push(await buildDesktopTerminalRunEvent(item.sessionID, item.status, item.evidence, item.rows));
+    } catch {}
+  }
+  return events;
+}
+
 async function pluginWideDesktopDetailEvent(previousSignature = "") {
   const identity = await currentDesktopIdentity();
   const sessionID = firstNonEmpty(identity && identity.storedID);
@@ -1506,6 +1571,10 @@ async function pluginWideDesktopDetailEvent(previousSignature = "") {
   const described = await describeControls(session);
   const detail = described && described.details;
   if (!detail || detail.desktop_foreground !== true) return { signature: "", event: null };
+  const runStatus = String((detail.run && detail.run.status) || detail.status || "idle").trim().toLowerCase();
+  if (runStatus === "running" || runStatus === "waiting_approval") {
+    desktopRunWatchStart(sessionID);
+  }
   const signature = desktopDetailSignature(sessionID, detail);
   if (!signature || signature === previousSignature) return { signature, event: null };
   const hint = desktopSessionHint(session, detail);
@@ -3135,6 +3204,9 @@ async function* subscribePlugin(signal) {
   let foregroundSignature = "";
   try {
     while (!signal || !signal.aborted) {
+      for (const event of await drainDesktopTerminalEvents()) {
+        yield event;
+      }
       const directoryChanged = await watcher.next(DESKTOP_INTERACTION_POLL_MS);
       if (directoryChanged) {
         yield {
