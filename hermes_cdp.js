@@ -1210,6 +1210,47 @@ function processMatchesUserDataDir(proc, userDataDir = "") {
   return String((proc && proc.command) || "").includes(`--user-data-dir=${normalized}`);
 }
 
+// Loopback ports the given pids currently listen on. Read-only CDP
+// rediscovery for a running desktop whose DevToolsActivePort cache is gone
+// (Chromium removes it on some relaunches; a managed instance can outlive the
+// Hub that launched it). macOS only — managed launch itself is macOS-only.
+// The -a flag is required: lsof ORs its selections without it, which would
+// return every listening socket on the machine.
+async function listListeningPorts(pids = []) {
+  if (process.platform !== "darwin" || !pids.length) return [];
+  const output = await commandOutput("/usr/sbin/lsof", ["-a", "-nP", "-iTCP", "-sTCP:LISTEN", "-p", pids.join(",")], {
+    timeout: 5000,
+    maxBuffer: 1024 * 1024,
+  }).catch(() => "");
+  const ports = new Set();
+  for (const match of String(output || "").matchAll(/TCP\s+\S+:(\d+)\s+\(LISTEN/gi)) {
+    ports.add(Number(match[1]));
+  }
+  return [...ports].sort((a, b) => a - b);
+}
+
+// Single-shot /json/list probe: unlike fetchPageTarget this never waits out
+// the full connect deadline, so probing several non-CDP ports stays cheap.
+// Auxiliary windows (avatar overlay, devtools) are excluded so a transient
+// secondary page cannot shadow the main window.
+async function probePageTargetOnce(listUrl, timeoutMs = 1500) {
+  try {
+    const response = await fetch(listUrl, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs) });
+    const targets = await response.json();
+    const auxPage = /avatar-overlay|devtools\//i;
+    const pages = Array.isArray(targets)
+      ? targets.filter((item) => {
+          if (!item || item.type !== "page" || !item.webSocketDebuggerUrl) return false;
+          return !auxPage.test(`${item.title || ""} ${item.url || ""}`);
+        })
+      : [];
+    const preferred = pages.find((item) => /hermes/i.test(`${item.title || ""} ${item.url || ""}`));
+    return preferred || pages[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 async function isHermesRunning(userDataDir = "") {
   const processes = await listHermesProcesses();
   return processes.some((proc) => processMatchesUserDataDir(proc, userDataDir));
@@ -1288,6 +1329,17 @@ class HermesDesktopController extends CdpPageClient {
         // It is a connection cache, never proof that the target still exists.
         try { fs.unlinkSync(portFile); } catch {}
       }
+    }
+    // Rediscover from the OS when the port cache is missing: a managed
+    // instance can outlive this Plugin (hub restart), and its CDP listener
+    // stays alive even though the DevToolsActivePort file is gone. Read-only;
+    // this never launches or stops anything.
+    const candidatePids = (await listHermesProcesses())
+      .filter((proc) => processMatchesUserDataDir(proc, userDataDir))
+      .map((proc) => proc.pid);
+    for (const port of await listListeningPorts(candidatePids)) {
+      const target = await probePageTargetOnce(`http://127.0.0.1:${port}/json/list`);
+      if (target) return target;
     }
     const running = await isHermesRunning(userDataDir);
     if (running) {
