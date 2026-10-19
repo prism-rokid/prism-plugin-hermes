@@ -8,10 +8,15 @@
 
 const DESKTOP_RUN_TRACK_TIMEOUT_MS = 30 * 60 * 1000;
 
-// finish_reason values are Hermes/LLM passthrough strings. Aborts and errors
-// are recognized by keyword; everything else counts as a completed turn.
-function desktopTerminalClassify(finishReason) {
+// finish_reason values are Hermes/LLM passthrough strings. Tool handoffs and
+// rows without a finish reason are intermediate steps, not terminal turns.
+function desktopTerminalClassify(finishReason, row = null) {
   const normalized = String(finishReason || "").trim().toLowerCase();
+  if (/(tool_calls?|function_call|tool_use)/.test(normalized)) return null;
+  if (!normalized) {
+    const content = String((row && (row.content || row.api_content)) || "").trim();
+    return content ? "interrupted" : null;
+  }
   if (/(abort|cancel|interrupt)/.test(normalized)) return "interrupted";
   if (/(error|fail)/.test(normalized)) return "failed";
   return "completed";
@@ -54,10 +59,11 @@ function createDesktopRunWatch({ readRowsAfter, now = () => Date.now() } = {}) {
       }
       const assistant = (Array.isArray(rows) ? rows : []).find((row) => (
         String((row && row.role) || "").trim().toLowerCase() === "assistant"
+        && desktopTerminalClassify(row.finish_reason, row) !== null
       ));
       if (!assistant) continue;
       trackers.delete(sessionID);
-      const status = desktopTerminalClassify(assistant.finish_reason);
+      const status = desktopTerminalClassify(assistant.finish_reason, assistant);
       const evidence = Math.max(0, Number(assistant.id) || 0);
       const recorded = emitted.get(sessionID);
       if (recorded && recorded.status === status && evidence <= recorded.evidence) continue;

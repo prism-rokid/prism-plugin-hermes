@@ -15,12 +15,42 @@ function assistantRow(id, finishReason = "stop") {
 
 test("finish_reason classifies into completed, failed, and interrupted", () => {
   assert.equal(desktopTerminalClassify("stop"), "completed");
-  assert.equal(desktopTerminalClassify(""), "completed");
-  assert.equal(desktopTerminalClassify("tool_calls"), "completed");
+  assert.equal(desktopTerminalClassify(""), null);
+  assert.equal(desktopTerminalClassify("tool_calls"), null);
+  assert.equal(desktopTerminalClassify("", assistantRow(4, "")), "interrupted");
   assert.equal(desktopTerminalClassify("aborted by user"), "interrupted");
   assert.equal(desktopTerminalClassify("cancelled"), "interrupted");
   assert.equal(desktopTerminalClassify("api_error"), "failed");
   assert.equal(desktopTerminalClassify("failure: timeout"), "failed");
+});
+
+test("desktop tracker waits through tool handoffs until a terminal assistant row", async () => {
+  let rows = [assistantRow(100, "tool_calls"), { ...assistantRow(101, ""), content: "" }];
+  const watch = createDesktopRunWatch({
+    readRowsAfter: async (_sessionID, afterID) => rows.filter((row) => row.id > afterID),
+    now: () => 1000,
+  });
+
+  watch.start("sess-tools", 90);
+  assert.deepEqual(await watch.drain(), []);
+  assert.equal(watch.activeCount(), 1);
+
+  rows = [...rows, assistantRow(102, "stop")];
+  const [event] = await watch.drain();
+  assert.equal(event.status, "completed");
+  assert.equal(event.evidence, 102);
+  assert.equal(watch.activeCount(), 0);
+});
+
+test("desktop tracker reports a partial assistant row without finish reason as interrupted", async () => {
+  const watch = createDesktopRunWatch({
+    readRowsAfter: async () => [assistantRow(103, "")],
+    now: () => 1000,
+  });
+  watch.start("sess-aborted", 90);
+  const [event] = await watch.drain();
+  assert.equal(event.status, "interrupted");
+  assert.equal(event.evidence, 103);
 });
 
 test("tracker settles when an assistant row lands after the baseline", async () => {

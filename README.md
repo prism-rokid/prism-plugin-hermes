@@ -193,7 +193,7 @@ CDP renderer 求值内重新验证 stored/live session、approval 和 callback i
 
 当前限制：
 
-- 新会话必须通过 Hermes Desktop 原生 Composer 首次提交创建，不能以 Gateway
+- Desktop 模式的新会话必须通过 Hermes Desktop 原生 Composer 首次提交创建，不能以 Gateway
   `session.create` 替代。文本和附件首发都走 Renderer 的 `onAttachDroppedItems + onSubmit`；
   Plugin 只有在 route 获得 stored/live identity、`state.db` 已出现同一 session 且 user turn
   可见后才返回成功。Hermes 自身创建超时可能短暂留下 route identity，这不构成 Prism 成功，

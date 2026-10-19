@@ -80,8 +80,9 @@ function resolveBackend() {
 
 // Create a Gateway client. `resolveConnection` is the normal Desktop path and
 // must return its authorized wsUrl. `onEvent` receives pushed Gateway events.
-function createGatewayClient({ onEvent, resolveConnection } = {}) {
+function createGatewayClient({ onEvent, onServerRequest, advertiseServerRequests = false, resolveConnection } = {}) {
   let ws = null;
+  let capabilitiesSocket = null;
   let nextId = 1;
   const pending = new Map(); // id -> {resolve, reject, timer}
   const eventListeners = new Set();
@@ -117,13 +118,38 @@ function createGatewayClient({ onEvent, resolveConnection } = {}) {
       }
       return;
     }
+    if (msg.id !== undefined && typeof msg.method === "string") {
+      const socket = ws;
+      const respond = (response) => {
+        if (!socket || ws !== socket || socket.readyState !== WebSocket.OPEN) return;
+        try {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...response }));
+        } catch {}
+      };
+      if (typeof onServerRequest !== "function") {
+        respond({ error: { code: -32601, message: `No handler registered for method: ${msg.method}` } });
+        return;
+      }
+      Promise.resolve()
+        .then(() => onServerRequest({ id: msg.id, method: msg.method, params: msg.params || {} }))
+        .then((result) => respond({ result: result === undefined ? null : result }))
+        .catch((error) => respond({ error: {
+          code: Number.isInteger(error && error.code) ? error.code : -32603,
+          message: String(error && error.message || "Hermes client request failed"),
+        } }));
+      return;
+    }
     // Gateway events, including gateway.ready, are part of the normal event
     // stream. Hermes Desktop's official client considers the connection ready
     // on WebSocket open and does not turn gateway.ready into a second handshake.
-    if (onEvent && msg.method === "event" && msg.params && msg.params.type) {
-      onEvent(msg.params);
+    if (msg.method === "event" && msg.params && msg.params.type) {
+      if (onEvent) onEvent(msg.params);
       for (const listener of eventListeners) {
         try { listener(msg.params); } catch {}
+      }
+      if (advertiseServerRequests && msg.params.type === "gateway.ready" && capabilitiesSocket !== ws) {
+        capabilitiesSocket = ws;
+        void request("client.capabilities", { server_requests: true }, 15000).catch(() => {});
       }
     }
   }
@@ -332,7 +358,7 @@ function createGatewayClient({ onEvent, resolveConnection } = {}) {
   }
 
   async function createSession(cwd = "") {
-    const params = { cols: 120, rows: 40, source: "prism" };
+    const params = { cols: 120, source: "prism" };
     if (cwd) params.cwd = cwd;
     return request("session.create", params, 30000);
   }

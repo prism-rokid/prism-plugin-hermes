@@ -87,6 +87,7 @@ const DESKTOP_INTERACTION_POLL_MS = 1500;
 const DRAFT_TTL_MS = 30 * 60 * 1000;
 let desktopIdentityCache = { storedID: "", liveID: "", expiresAt: 0, refreshPromise: null };
 const gatewayEvents = [];
+const nativeApprovalResponses = new Map();
 let desktopGatewayEventCursor = 0;
 let gatewayClient = null;
 let gatewayDiscoveryClient = null;
@@ -103,6 +104,17 @@ function recordGatewayEvent(event) {
     gatewayEvents.splice(0, gatewayEvents.length - GATEWAY_EVENT_LIMIT);
   }
   const eventType = firstNonEmpty(event.type);
+  if (eventType === "request.cancel") {
+    const rpcRequestID = firstNonEmpty(event.params && event.params.id, event.payload && event.payload.id);
+    for (const [approvalID, pending] of nativeApprovalResponses) {
+      if (pending.rpcRequestID !== rpcRequestID) continue;
+      nativeApprovalResponses.delete(approvalID);
+      resolvedNativeApprovalByID.set(approvalID, Date.now());
+      approvalLiveSessionByID.delete(approvalID);
+      pending.resolve(null);
+      break;
+    }
+  }
   const liveID = firstNonEmpty(event.session_id);
   if (liveID && eventType === "session.info") {
     const runtime = runtimeInfoFromGatewaySession(event.payload);
@@ -165,6 +177,8 @@ function hermesGateway() {
       // client; it reuses Hermes Desktop's renderer-owned HermesGateway.
       resolveConnection: () => gatewayConnectionResolver(),
       onEvent: recordGatewayEvent,
+      onServerRequest: handleNativeGatewayRequest,
+      advertiseServerRequests: true,
     });
   }
   return gatewayClient;
@@ -1339,6 +1353,8 @@ async function historyRows(sessionID, limit) {
       FROM messages
       WHERE session_id = '${escapeSQLite(normalized)}'
         AND LOWER(COALESCE(role, '')) IN ('user', 'assistant')
+        AND active = 1
+        AND COALESCE(display_kind, '') <> 'hidden'
       ORDER BY id DESC
       ${innerLimit}
     )
@@ -1849,6 +1865,36 @@ function hermesApprovalActions() {
   ];
 }
 
+function handleNativeGatewayRequest(request) {
+  const method = firstNonEmpty(request && request.method);
+  if (method !== "approval") {
+    const error = new Error(`Hermes Native does not handle Gateway request: ${method || "unknown"}`);
+    error.code = -32601;
+    throw error;
+  }
+  const params = request && request.params && typeof request.params === "object" ? request.params : {};
+  const liveID = firstNonEmpty(params.session_id);
+  const canonicalID = canonicalSessionIDForLive(liveID);
+  const receivedAt = Date.now();
+  const event = {
+    type: "approval.request",
+    session_id: liveID,
+    received_at: receivedAt,
+    payload: { ...params, rpc_request_id: String(request.id) },
+  };
+  const approvalID = nativeApprovalID(event, canonicalID);
+  return new Promise((resolve) => {
+    nativeApprovalResponses.set(approvalID, {
+      resolve,
+      rpcRequestID: String(request.id),
+      liveSessionID: liveID,
+      canonicalSessionID: canonicalID,
+    });
+    if (approvalID && liveID) approvalLiveSessionByID.set(approvalID, liveID);
+    recordGatewayEvent(event);
+  });
+}
+
 function nativeApprovalWasResolved(approvalID, eventReceivedAt = 0) {
   const resolvedAt = Number(resolvedNativeApprovalByID.get(firstNonEmpty(approvalID)) || 0);
   if (!resolvedAt) return false;
@@ -1908,8 +1954,12 @@ async function readStatus(session, runID) {
   const desktopInteractions = HERMES_CONNECTION_MODE === "desktop"
     ? await readDesktopInteractionProjection(sessionID)
     : null;
+  // An editable busy composer can still route ordinary text through Hermes'
+  // steer path. Until the renderer exposes an explicit queue mode, do not
+  // advertise queueing from editability alone.
   const desktopCanQueue = Boolean(desktopInteractions && desktopInteractions.foreground
-    && desktopInteractions.composer && desktopInteractions.composer.editable === true);
+    && desktopInteractions.composer && desktopInteractions.composer.editable === true
+    && desktopInteractions.composer.busy !== true);
   const approval = HERMES_CONNECTION_MODE === "native"
     ? await recentApprovalForSession(sessionID)
     : null;
@@ -2071,6 +2121,7 @@ function detailSnapshot(session, runtime, controls = {}) {
   const active = approvalBlocked || Boolean(runtime && runtime.Active);
   const canQueue = controls.desktop_foreground === true
     && Boolean(controls.composer && controls.composer.editable === true)
+    && controls.composer.busy !== true
     && !approvalBlocked;
   const primaryAction = approvalBlocked || Boolean(runtime && runtime.ApprovalBlocked)
     ? "approval"
@@ -2124,6 +2175,7 @@ function detailSnapshot(session, runtime, controls = {}) {
       approval_blocked: approvalBlocked || Boolean(runtime && runtime.ApprovalBlocked),
       approval,
       primary_action: primaryAction,
+      can_queue: canQueue,
       summary: firstNonEmpty(runtime && runtime.Preview, runtime && runtime.Final, runtime && runtime.Error),
     },
   };
@@ -3680,7 +3732,13 @@ async function nativeResolveApproval(req) {
   }
   const selected = await nativeEnsureLiveSession(canonicalID);
   const liveID = firstNonEmpty(approvalLiveSessionByID.get(approvalID), selected.liveID);
-  await hermesGateway().respondApproval(actionID, liveID);
+  const pending = nativeApprovalResponses.get(approvalID);
+  if (pending) {
+    nativeApprovalResponses.delete(approvalID);
+    pending.resolve({ choice: actionID === "once" ? "once" : "deny" });
+  } else {
+    await hermesGateway().respondApproval(actionID, liveID);
+  }
   resolvedNativeApprovalByID.set(approvalID, Date.now());
   approvalLiveSessionByID.delete(approvalID);
 }

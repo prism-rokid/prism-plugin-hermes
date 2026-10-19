@@ -5,13 +5,21 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const controls = require("../hermes_controls");
-const { HermesDesktopController, selectDesktopComposerCandidate } = require("../hermes_cdp");
+const { HermesDesktopController, selectDesktopComposerCandidate, walkFiberTree } = require("../hermes_cdp");
 
 test("Hermes session subscription replays a Prism-owned run from its start", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
   assert.match(source, /const subscribedRun = activeRunForSession\(subscribedSessionID\)/);
   assert.match(source, /runStartedAtMs - 2000/);
   assert.doesNotMatch(source, /let sinceMs = Date\.now\(\) - 1000;/);
+});
+
+test("Hermes history queries omit inactive and hidden rows", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  const historyQuery = source.slice(source.indexOf("async function historyRows("), source.indexOf("// The public body wire"));
+
+  assert.match(historyQuery, /AND active = 1/);
+  assert.match(historyQuery, /COALESCE\(display_kind, ''\) <> 'hidden'/);
 });
 
 test("Hermes model options keep the provider/model pair as one stable target", () => {
@@ -418,4 +426,50 @@ test("Hermes Desktop session actions support current header and collection callb
   assert.match(source, /props\.onArchiveSession/);
   assert.match(source, /props\.onDeleteSession/);
   assert.match(source, /collection\[0\]\(\"stored-1\"\)/);
+});
+
+test("Hermes Desktop queue actions await the native async callback", async () => {
+  const controller = new HermesDesktopController();
+  let source = "";
+  controller.ensureReady = async () => {};
+  controller.evaluate = async (expression) => {
+    source = expression;
+    return true;
+  };
+
+  await controller.executeDesktopInteraction("queue", "stored-1", "live-1", {
+    itemID: "queue-1",
+    actionID: "queue.hermes.queue-1.callback-1",
+  });
+
+  assert.match(source, /\(async \(\) =>/);
+  assert.match(source, /await Promise\.resolve\(candidate\.callback\(candidate\.argument\)\)/);
+  assert.match(source, /walkFiberTree\(root, 180/);
+  assert.doesNotMatch(source, /findPanel/);
+});
+
+test("Hermes Desktop Fiber traversal handles deep renderer trees without recursion", () => {
+  const root = {};
+  let node = root;
+  for (let index = 0; index < 20000; index += 1) {
+    node.child = {};
+    node = node.child;
+  }
+
+  let visited = 0;
+  assert.equal(walkFiberTree(root, 20000, () => {
+    visited += 1;
+    return false;
+  }), false);
+  assert.equal(visited, 20001);
+});
+
+test("Hermes Desktop publishes queue capability in the nested run snapshot", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  const detailSnapshot = source.slice(source.indexOf("function detailSnapshot("));
+  const runSnapshot = detailSnapshot.slice(detailSnapshot.indexOf("    run: {"));
+
+  assert.match(source, /desktopInteractions\.composer\.busy !== true/);
+  assert.match(detailSnapshot, /controls\.composer\.busy !== true/);
+  assert.match(runSnapshot, /can_queue: canQueue/);
 });

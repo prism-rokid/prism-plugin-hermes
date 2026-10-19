@@ -30,6 +30,26 @@ function desktopRouteSessionIDSource() {
   })()`;
 }
 
+function walkFiberTree(root, maxDepth, visit) {
+  const pending = [{ fiber: root, depth: 0 }];
+  const visited = new Set();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const fiber = current && current.fiber;
+    const depth = current && current.depth;
+    if (!fiber || visited.has(fiber) || depth > maxDepth) continue;
+    visited.add(fiber);
+    if (visit(fiber, depth) === true) return true;
+    if (fiber.sibling) pending.push({ fiber: fiber.sibling, depth });
+    if (fiber.child) pending.push({ fiber: fiber.child, depth: depth + 1 });
+  }
+  return false;
+}
+
+function walkFiberTreeSource() {
+  return `${walkFiberTree.toString()};`;
+}
+
 function desktopIdentitySource() {
   return `(() => {
     const fiberFor = (element) => {
@@ -559,6 +579,7 @@ function desktopCancelSource(expectedStoredSessionID, expectedLiveSessionID) {
 
 function desktopSessionDirectorySource() {
   return `(() => {
+    ${walkFiberTreeSource()}
     const fiberFor = (element) => {
       const key = element && Object.getOwnPropertyNames(element).find((name) => name.startsWith('__reactFiber$'));
       return key ? element[key] : null;
@@ -566,7 +587,6 @@ function desktopSessionDirectorySource() {
     const sidebar = document.querySelector('[data-slot="sidebar"]');
     const sidebarFiber = fiberFor(sidebar);
     if (!sidebarFiber) return [];
-    const visited = new Set();
     const groups = [];
     const collect = (fiber) => {
       const props = fiber && fiber.memoizedProps;
@@ -575,19 +595,15 @@ function desktopSessionDirectorySource() {
         groups.push(sessions.map((session) => session.id.trim()));
       }
     };
-    const visit = (fiber, depth) => {
-      if (!fiber || visited.has(fiber) || depth > 220) return;
-      visited.add(fiber);
-      collect(fiber);
-      visit(fiber.child, depth + 1);
-      visit(fiber.sibling, depth);
-    };
     // A sidebar list can be owned by a React component immediately above the
     // host element, so inspect that ancestor chain. Do not start from the
     // application root: it would also see session arrays from the composer,
     // history and other non-directory surfaces.
     for (let fiber = sidebarFiber, depth = 0; fiber && depth < 80; fiber = fiber.return, depth += 1) collect(fiber);
-    visit(sidebarFiber.child, 0);
+    walkFiberTree(sidebarFiber.child, 220, (fiber) => {
+      collect(fiber);
+      return false;
+    });
     const seen = new Set();
     const ordered = [];
     for (const group of groups) {
@@ -608,6 +624,7 @@ function desktopSessionDirectorySource() {
 // from translated labels or a button position.
 function desktopInteractionSource(expectedStoredSessionID = "", expectedLiveSessionID = "") {
   return `(() => {
+    ${walkFiberTreeSource()}
     const expectedStored = ${JSON.stringify(String(expectedStoredSessionID || "").trim())};
     const expectedLive = ${JSON.stringify(String(expectedLiveSessionID || "").trim())};
     const registryKey = Symbol.for('prism.hermes.desktop-interactions.v1');
@@ -701,20 +718,19 @@ function desktopInteractionSource(expectedStoredSessionID = "", expectedLiveSess
     };
     const queuePanel = (() => {
       if (!scoped || !composer || entryIDs.size === 0) return null;
-      const seen = new Set();
-      const visit = (fiber, depth) => {
-        if (!fiber || seen.has(fiber) || depth > 180) return null;
-        seen.add(fiber);
+      let match = null;
+      walkFiberTree(rootFor(composer), 180, (fiber) => {
         const props = fiber.memoizedProps;
         if (props && sameEntrySet(props.entries)
           && typeof props.onEdit === 'function'
           && typeof props.onDelete === 'function'
           && typeof props.onSendNow === 'function') {
-          return { fiber, props };
+          match = { fiber, props };
+          return true;
         }
-        return visit(fiber.child, depth + 1) || visit(fiber.sibling, depth);
-      };
-      return visit(rootFor(composer), 0);
+        return false;
+      });
+      return match;
     })();
     const actionsByItem = new Map();
     if (queuePanel) {
@@ -759,10 +775,7 @@ function desktopInteractionSource(expectedStoredSessionID = "", expectedLiveSess
           ? parsed.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim())
           : []);
       } catch {}
-      const seen = new Set();
-      const visit = (fiber, depth) => {
-        if (!fiber || seen.has(fiber) || depth > 240) return;
-        seen.add(fiber);
+      walkFiberTree(rootFor(composer), 240, (fiber) => {
         const props = fiber.memoizedProps;
         const rowSession = props && typeof props === 'object' && props.session && typeof props.session === 'object'
           ? props.session : null;
@@ -828,10 +841,8 @@ function desktopInteractionSource(expectedStoredSessionID = "", expectedLiveSess
             });
           }
         }
-        visit(fiber.child, depth + 1);
-        visit(fiber.sibling, depth);
-      };
-      visit(rootFor(composer), 0);
+        return false;
+      });
     }
     const uniqueAction = (candidates, key) => {
       const values = [...new Set(candidates.map((candidate) => candidate[key]).filter(Boolean))];
@@ -979,7 +990,8 @@ function interactionActionTargetSource(kind = "", expectedStoredSessionID = "", 
 
 function applyQueuePanelActionSource(expectedStoredSessionID = "", expectedLiveSessionID = "", itemID = "", actionID = "") {
   const snapshotSource = desktopInteractionSource(expectedStoredSessionID, expectedLiveSessionID);
-  return `(() => {
+  return `(async () => {
+    ${walkFiberTreeSource()}
     const state = ${snapshotSource};
     const requiredItemID = ${JSON.stringify(String(itemID || '').trim())};
     const requiredActionID = ${JSON.stringify(String(actionID || '').trim())};
@@ -996,18 +1008,18 @@ function applyQueuePanelActionSource(expectedStoredSessionID = "", expectedLiveS
     const composer = document.querySelector('[data-slot="composer-root"]');
     let root = fiberFor(composer);
     while (root && root.return) root = root.return;
-    const seen = new Set();
-    const findPanel = (fiber, depth) => {
-      if (!fiber || seen.has(fiber) || depth > 180) return null;
-      seen.add(fiber);
+    let panel = null;
+    walkFiberTree(root, 180, (fiber) => {
       const props = fiber.memoizedProps;
       const entries = props && props.entries;
       if (Array.isArray(entries) && entries.length === ids.size
         && entries.every((entry) => entry && ids.has(String(entry.id || '')))
-        && typeof props.onEdit === 'function' && typeof props.onDelete === 'function' && typeof props.onSendNow === 'function') return fiber;
-      return findPanel(fiber.child, depth + 1) || findPanel(fiber.sibling, depth);
-    };
-    const panel = findPanel(root, 0);
+        && typeof props.onEdit === 'function' && typeof props.onDelete === 'function' && typeof props.onSendNow === 'function') {
+        panel = fiber;
+        return true;
+      }
+      return false;
+    });
     if (!panel || !panel.memoizedProps) return false;
     const props = panel.memoizedProps;
     const entries = Array.isArray(props.entries) ? props.entries : [];
@@ -1021,7 +1033,7 @@ function applyQueuePanelActionSource(expectedStoredSessionID = "", expectedLiveS
     for (const candidate of candidates) {
       const token = candidate.callback && registry.actions.get(candidate.callback);
       if ('queue.hermes.' + requiredItemID + '.' + token !== requiredActionID) continue;
-      candidate.callback(candidate.argument);
+      await Promise.resolve(candidate.callback(candidate.argument));
       return true;
     }
     return false;
@@ -1031,6 +1043,7 @@ function applyQueuePanelActionSource(expectedStoredSessionID = "", expectedLiveS
 function applySessionRowActionSource(expectedStoredSessionID = "", expectedLiveSessionID = "", actionID = "") {
   const snapshotSource = desktopInteractionSource(expectedStoredSessionID, expectedLiveSessionID);
   return `(() => {
+    ${walkFiberTreeSource()}
     const state = ${snapshotSource};
     const requiredActionID = ${JSON.stringify(String(actionID || '').trim())};
     if (!state || state.scoped !== true || !state.session_actions
@@ -1046,13 +1059,10 @@ function applySessionRowActionSource(expectedStoredSessionID = "", expectedLiveS
     const composer = document.querySelector('[data-slot="composer-root"]');
     let root = fiberFor(composer);
     while (root && root.return) root = root.return;
-    const seen = new Set();
     const directCandidates = [];
     const collectionCandidates = [];
     const legacyCandidates = [];
-    const visit = (fiber, depth) => {
-      if (!fiber || seen.has(fiber) || depth > 240) return;
-      seen.add(fiber);
+    walkFiberTree(root, 240, (fiber) => {
       const props = fiber.memoizedProps;
       const rowSession = props && typeof props === 'object' && props.session && typeof props.session === 'object'
         ? props.session : null;
@@ -1095,10 +1105,8 @@ function applySessionRowActionSource(expectedStoredSessionID = "", expectedLiveS
         if ('hermes.session.archive.' + archiveToken === requiredActionID) legacyCandidates.push(props.onArchive);
         if ('hermes.session.delete.' + deleteToken === requiredActionID) legacyCandidates.push(props.onDelete);
       }
-      visit(fiber.child, depth + 1);
-      visit(fiber.sibling, depth);
-    };
-    visit(root, 0);
+      return false;
+    });
     const direct = [...new Set(directCandidates.filter(Boolean))];
     if (direct.length === 1) {
       direct[0]();
@@ -1806,4 +1814,5 @@ module.exports = {
   defaultProfileDir,
   hermesAppPath,
   selectDesktopComposerCandidate,
+  walkFiberTree,
 };

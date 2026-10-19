@@ -5,7 +5,8 @@ const ACTIVE_MODEL_DIRECTIVE = /^\[System: The active model for this chat has ch
 function isHermesInternalHistoryRow(row) {
   const role = String(row && row.role || "").trim().toLowerCase();
   const content = String(row && row.content || "").trim();
-  return role === "user" && ACTIVE_MODEL_DIRECTIVE.test(content);
+  return row && (row.active === 0 || row.display_kind === "hidden")
+    || (role === "user" && ACTIVE_MODEL_DIRECTIVE.test(content));
 }
 
 module.exports = {

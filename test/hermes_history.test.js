@@ -21,3 +21,9 @@ test("Hermes preserves ordinary user messages about model or provider changes", 
     content: "[System: The active model for this chat has changed to gpt-5.6-sol via provider openai-api. From this point forward, use this runtime metadata when answering questions about what model/provider is active.]",
   }), false);
 });
+
+test("Hermes hides inactive and explicitly hidden history rows", () => {
+  assert.equal(isHermesInternalHistoryRow({ role: "user", content: "rewound prompt", active: 0 }), true);
+  assert.equal(isHermesInternalHistoryRow({ role: "assistant", content: "internal", display_kind: "hidden" }), true);
+  assert.equal(isHermesInternalHistoryRow({ role: "user", content: "visible prompt", active: 1 }), false);
+});
