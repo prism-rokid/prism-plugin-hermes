@@ -1145,10 +1145,11 @@ function defaultAppPath() {
     return "/Applications/Hermes.app/Contents/MacOS/Hermes-Setup";
   }
   if (process.platform === "win32") {
-    return firstNonEmpty(
+    const candidates = [
       process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Hermes", "Hermes.exe") : "",
       process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "Hermes", "Hermes.exe") : "",
-    );
+    ].filter(Boolean);
+    return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || "";
   }
   return firstNonEmpty(process.env.PRISM_HERMES_LINUX_COMMAND, "hermes-desktop", "hermes");
 }
@@ -1196,6 +1197,16 @@ async function listHermesProcesses() {
       .filter((proc) => /Hermes\.app|\/Hermes\b|hermes-desktop/i.test(proc.command));
   }
   if (process.platform === "win32") {
+    const modern = await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='Hermes.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"], {
+      timeout: 8000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    if (modern) {
+      try {
+        const parsed = JSON.parse(modern);
+        return (Array.isArray(parsed) ? parsed : [parsed]).map((row) => ({ pid: Number(row.ProcessId), command: firstNonEmpty(row.CommandLine) })).filter((row) => row.pid);
+      } catch {}
+    }
     const output = await commandOutput("cmd.exe", ["/c", "wmic process where \"name='Hermes.exe'\" get ProcessId,CommandLine /format:list"], {
       timeout: 8000,
       maxBuffer: 2 * 1024 * 1024,

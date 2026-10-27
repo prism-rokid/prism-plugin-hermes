@@ -208,10 +208,45 @@ function createTerminalHandoff(wsUrl) {
 }
 
 function launchManagedHermesTui({ bin, cwd, wsUrl, platform = process.platform, spawnImpl = spawn, handoffFactory = createTerminalHandoff } = {}) {
-  if (platform !== "darwin") throw new Error("managed Hermes TUI currently supports macOS only");
+  if (platform !== "darwin" && platform !== "win32") throw new Error("当前平台不支持 Hermes 托管终端");
   if (!bin || !wsUrl) throw new Error("managed Hermes TUI requires executable and Gateway URL");
   const handoff = handoffFactory(wsUrl);
   if (!handoff || !handoff.file || !handoff.dir) throw new Error("managed Hermes TUI could not prepare the local relay handoff");
+  if (platform === "win32") {
+    const helper = path.join(__dirname, "hermes_tui_windows.js");
+    const args = [helper, handoff.file, bin, cwd || process.cwd()];
+    const options = { detached: true, stdio: "ignore" };
+    const startConsole = () => {
+      const command = `start "" "${process.execPath}" ${args.map((arg) => `"${arg}"`).join(" ")}`;
+      const fallback = spawnImpl("cmd.exe", ["/d", "/s", "/c", command], options);
+      fallback.once?.("error", () => handoff.cleanup?.());
+      fallback.once?.("exit", (code) => { if (code !== 0) handoff.cleanup?.(); });
+      fallback.unref?.();
+      return fallback;
+    };
+    let child;
+    let fallbackStarted = false;
+    try {
+      child = spawnImpl("wt.exe", ["new-tab", process.execPath, ...args], options);
+    } catch {
+      fallbackStarted = true;
+      try { child = startConsole(); }
+      catch { handoff.cleanup?.(); throw new Error("无法打开 Hermes 终端；请检查 Windows 桌面会话。"); }
+    }
+    const fallback = () => {
+      if (fallbackStarted) return;
+      fallbackStarted = true;
+      try { startConsole(); } catch { handoff.cleanup?.(); }
+    };
+    if (!fallbackStarted && child) {
+      child.once?.("error", fallback);
+      child.once?.("exit", (code) => { if (code !== 0) fallback(); });
+    }
+    const timer = setTimeout(() => handoff.cleanup?.(), TERMINAL_HANDOFF_TTL_MS);
+    timer.unref?.();
+    child.unref?.();
+    return child;
+  }
   // Keep the URL out of osascript/Terminal argv. The shell reads it once,
   // removes the 0600 handoff file, then supplies it only to the TUI environment.
   const handoffFile = shellQuote(handoff.file);

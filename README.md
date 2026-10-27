@@ -281,6 +281,11 @@ Renderer 内异步 mutation：调用立即返回 opaque mutation ID，不把 Her
 - `PRISM_HERMES_BACKEND_URL` / `PRISM_HERMES_BACKEND_TOKEN`（仅独立 Gateway 开发调试）
 - `HERMES_HOME`
 - `HERMES_BIN`
+- `PRISM_SQLITE3_BIN`（Windows 内置 SQLite 读取组件不可用时，可显式指定 `sqlite3.exe`）
+
+Windows 上默认读取 `%USERPROFILE%\.hermes\state.db`，也可用 `HERMES_HOME` 指向实际状态目录。
+发布包包含 SQLite 读取组件；探测会验证数据库能否读取，再声明 Desktop 可用。
+Native 托管终端优先使用 Windows Terminal；未安装时回退系统控制台，连接地址通过临时文件传递。
 
 通过 Prism Desktop 安装：在插件页直接输入本地路径 `plugins/hermes`。
 

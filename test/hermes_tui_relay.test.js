@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const { createHermesTuiRelay, launchManagedHermesTui } = require("../hermes_tui_relay");
 
 function onceOpen(socket) {
@@ -101,4 +102,26 @@ test("managed TUI launch only injects the loopback relay URL into Terminal", () 
   assert.match(spawnCall[1][1], /cat '\/private\/tmp\/prism-hermes-tui-test\/gateway-url'/);
   assert.match(spawnCall[1][1], /export HERMES_TUI_GATEWAY_URL=\\"\$relay_url\\"/);
   assert.match(spawnCall[1][1], /'\/Users\/test\/\.local\/bin\/hermes' --tui/);
+});
+
+test("Windows 终端缺失时回退系统控制台且命令行不包含连接令牌", () => {
+  const calls = [];
+  const handoff = { file: "C:\\Temp\\gateway-url", dir: "C:\\Temp", cleanup() {} };
+  launchManagedHermesTui({
+    bin: "C:\\Hermes\\Hermes.exe",
+    cwd: "C:\\work",
+    wsUrl: "ws://127.0.0.1:32123/prism/hermes/tui?token=secret-token",
+    platform: "win32",
+    handoffFactory: () => handoff,
+    spawnImpl: (command, args) => {
+      const child = Object.assign(new EventEmitter(), { unref() {} });
+      calls.push({ command, args, child });
+      return child;
+    },
+  });
+  assert.equal(calls[0].command, "wt.exe");
+  calls[0].child.emit("error", new Error("未找到 Windows Terminal"));
+  assert.equal(calls[1].command, "cmd.exe");
+  assert.match(calls[1].args[3], /start ""/);
+  assert.doesNotMatch(JSON.stringify(calls.map(({ args }) => args)), /secret-token/);
 });

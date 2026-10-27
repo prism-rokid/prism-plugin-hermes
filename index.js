@@ -530,7 +530,7 @@ async function resolveHermesBin() {
   }
   const candidates = [
     firstNonEmpty(process.env.HERMES_BIN),
-    path.join(os.homedir(), ".local", "bin", "hermes"),
+    path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "hermes.exe" : "hermes"),
     "/opt/homebrew/bin/hermes",
     "/usr/local/bin/hermes",
   ].filter(Boolean);
@@ -541,11 +541,11 @@ async function resolveHermesBin() {
     }
   }
   try {
-    const { stdout } = await execFileAsync("/usr/bin/which", ["hermes"], {
+    const { stdout } = await execFileAsync(process.platform === "win32" ? "where.exe" : "/usr/bin/which", [process.platform === "win32" ? "hermes.exe" : "hermes"], {
       timeout: 3000,
       maxBuffer: 16 * 1024,
     });
-    const found = firstNonEmpty(stdout);
+    const found = firstNonEmpty(String(stdout || "").split(/\r?\n/)[0]);
     if (found) {
       resolvedHermesBin = found;
       return resolvedHermesBin;
@@ -556,18 +556,23 @@ async function resolveHermesBin() {
   return "";
 }
 
-async function hermesDesktopAvailable() {
+async function hermesDesktopAvailability() {
   const bin = await resolveHermesBin();
-  if (!(Boolean(bin) || fs.existsSync(HERMES_APP) || fs.existsSync(hermesAppPath())) || !fs.existsSync(SESSION_DB)) {
-    return false;
+  if (!(Boolean(bin) || fs.existsSync(HERMES_APP) || fs.existsSync(hermesAppPath()))) {
+    return { available: false, reason: "找不到 Hermes；请检查安装位置或设置 HERMES_BIN。" };
+  }
+  if (!fs.existsSync(SESSION_DB)) {
+    return { available: false, reason: "找不到 Hermes 会话数据库；请检查 HERMES_HOME。" };
+  }
+  if (process.platform === "win32") {
+    try { await queryJSON("SELECT 1 AS ready"); }
+    catch { return { available: false, reason: "无法读取 Hermes 会话数据库；请检查 HERMES_HOME 或重新安装插件。" }; }
   }
   try {
-    // An empty sidebar is valid. Reaching the renderer is what distinguishes
-    // an actual Desktop runtime from stale state.db/CLI history.
     await cdpController.desktopSessionDirectoryIDs();
-    return true;
+    return { available: true, reason: "" };
   } catch {
-    return false;
+    return { available: false, reason: "无法连接 Hermes Desktop；请启动桌面应用。" };
   }
 }
 
@@ -575,12 +580,16 @@ async function queryJSON(sql) {
   if (!fs.existsSync(SESSION_DB)) {
     return [];
   }
+  if (process.platform === "win32" && !process.env.PRISM_SQLITE3_BIN) {
+    try { return require("./windows_sqlite").readRows(SESSION_DB, sql, SQLITE_TIMEOUT_MS); }
+    catch { throw new Error("无法读取 Hermes 会话数据库；请检查 HERMES_HOME 或重新安装插件。"); }
+  }
   const databaseURI = (immutable = false) => {
     const suffix = immutable ? "?mode=ro&immutable=1" : "?mode=ro";
     return `${pathToFileURL(SESSION_DB).href}${suffix}`;
   };
   const runQuery = (immutable) => execFileAsync(
-    "/usr/bin/sqlite3",
+    process.env.PRISM_SQLITE3_BIN || "/usr/bin/sqlite3",
     ["-readonly", "-cmd", `.timeout ${SQLITE_TIMEOUT_MS}`, "-json", databaseURI(immutable), sql],
     {
       timeout: QUERY_TIMEOUT_MS,
@@ -1423,6 +1432,7 @@ function createHistoryWatcher(signal) {
     }, HISTORY_WATCH_DEBOUNCE_MS);
   };
   localStateChangeListeners.add(schedule);
+  const pollTimer = process.platform === "win32" ? setInterval(schedule, 1500) : null;
   // macOS may reject directory-level fs.watch with EMFILE once the system
   // FSEvents budget is exhausted. Watching the two SQLite files directly is
   // both cheaper and sufficient for a running Hermes Desktop in WAL mode.
@@ -1432,6 +1442,7 @@ function createHistoryWatcher(signal) {
       const watcher = fs.watch(target, { persistent: false }, schedule);
       watcher.on("error", (error) => {
         if (closed) return;
+        if (pollTimer) return;
         failure = error instanceof Error ? error : new Error(String(error));
         notify();
       });
@@ -1440,12 +1451,13 @@ function createHistoryWatcher(signal) {
       // The other SQLite file remains a valid source of committed changes.
     }
   }
-  if (!watchers.length) {
+  if (!watchers.length && !pollTimer) {
     failure = new Error("Hermes SQLite change watcher is unavailable");
   }
   const abort = () => {
     closed = true;
     localStateChangeListeners.delete(schedule);
+    if (pollTimer) clearInterval(pollTimer);
     if (debounce) clearTimeout(debounce);
     for (const watcher of watchers) {
       try { watcher.close(); } catch {}
@@ -1737,7 +1749,7 @@ function capability(available) {
 }
 
 async function discovery() {
-  const available = await hermesDesktopAvailable();
+  const status = await hermesDesktopAvailability();
   const bin = await resolveHermesBin();
   return {
     PluginID: "hermes",
@@ -1751,10 +1763,10 @@ async function discovery() {
       app_bundle: HERMES_APP,
       mode: "desktop-gateway-rpc-plus-sqlite",
     },
-    Verified: available,
-    Detail: available
+    Verified: status.available,
+    Detail: status.available
       ? "Hermes Desktop renderer and ~/.hermes/state.db are available"
-      : "Hermes Desktop renderer or ~/.hermes/state.db is unavailable",
+      : status.reason,
   };
 }
 
@@ -3421,7 +3433,8 @@ const desktopAdapter = {
     return "hermes";
   },
   async probe() {
-    return capability(await hermesDesktopAvailable());
+    const status = await hermesDesktopAvailability();
+    return { ...capability(status.available), UnavailableReason: status.reason };
   },
   discover: discovery,
   startSessionWithMessage,
@@ -3453,7 +3466,7 @@ function nativeGatewayRuntime() {
   if (!nativeRuntime) {
     nativeRuntime = createHermesNativeRuntime({
       resolveHermesBin,
-      cwd: DEFAULT_PROJECT_DIR,
+      cwd: process.platform === "win32" ? normalizeCwd(DEFAULT_PROJECT_DIR) : DEFAULT_PROJECT_DIR,
     });
   }
   return nativeRuntime;
@@ -3763,9 +3776,9 @@ async function nativeOpenManagedTerminal(req = {}) {
   if (!nativeTuiRelay) nativeTuiRelay = createHermesTuiRelay({ gateway });
   const connection = await nativeTuiRelay.start();
   const bin = await resolveHermesBin();
-  if (!bin) throw new Error("hermes executable is unavailable for managed TUI");
+  if (!bin) throw new Error(process.platform === "win32" ? "找不到 Hermes；请检查安装位置或设置 HERMES_BIN。" : "hermes executable is unavailable for managed TUI");
   launchManagedHermesTui({ bin, cwd: normalizeCwd(req.Cwd || DEFAULT_PROJECT_DIR), wsUrl: connection.wsUrl });
-  return { ok: true, message: "Hermes managed terminal opened" };
+  return { ok: true, message: process.platform === "win32" ? "已打开 Hermes 终端" : "Hermes managed terminal opened" };
 }
 
 async function* subscribeNativePlugin(signal) {
@@ -3816,8 +3829,18 @@ async function* subscribeNativePlugin(signal) {
 const nativeAdapter = {
   id() { return "hermes"; },
   async probe() {
-    try { await nativeGatewayRuntime().connection(); await hermesGateway().ensureReady(); return { ...capability(true), NativeVisibleInput: false, NativeVisibleOutput: false, CanOpenManagedTerminal: true, VisibilitySurface: "hermes-native-gateway" }; }
-    catch (error) { return { ...capability(false), NativeVisibleInput: false, NativeVisibleOutput: false, VisibilitySurface: "hermes-native-gateway", UnavailableReason: firstNonEmpty(error && error.message, "hermes_native_gateway_unavailable") }; }
+    try {
+      await nativeGatewayRuntime().connection();
+      await hermesGateway().ensureReady();
+      if (process.platform === "win32" && fs.existsSync(SESSION_DB)) await queryJSON("SELECT 1 AS ready");
+      return { ...capability(true), NativeVisibleInput: false, NativeVisibleOutput: false, CanOpenManagedTerminal: true, VisibilitySurface: "hermes-native-gateway" };
+    }
+    catch (error) {
+      const reason = process.platform === "win32"
+        ? "Hermes Native 未就绪；请检查 HERMES_BIN、HERMES_HOME 和插件安装。"
+        : firstNonEmpty(error && error.message, "hermes_native_gateway_unavailable");
+      return { ...capability(false), NativeVisibleInput: false, NativeVisibleOutput: false, VisibilitySurface: "hermes-native-gateway", UnavailableReason: reason };
+    }
   },
   discover: nativeDiscovery,
   startSessionWithMessage: nativeStartSessionWithMessage,
