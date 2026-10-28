@@ -49,6 +49,7 @@ function createHermesNativeRuntime({ resolveHermesBin, cwd, spawnImpl = spawn } 
             cwd,
             env: { ...process.env, HERMES_DASHBOARD_SESSION_TOKEN: token },
             stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
           });
           const consume = (chunk) => {
             output = `${output}${String(chunk || "")}`.slice(-16_384);
