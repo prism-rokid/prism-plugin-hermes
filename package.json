@@ -1,7 +1,7 @@
 {
   "name": "hermes-automation-plugin",
   "private": true,
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Hermes local session database plus CLI adapter",
   "main": "index.js",
   "scripts": {
