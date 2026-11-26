@@ -556,23 +556,36 @@ async function resolveHermesBin() {
   return "";
 }
 
+function hermesDiagnostic(code, summary, transport, detail, actions, reachable) {
+  const Facts = { transport, ...(typeof reachable === "boolean" ? { transport_reachable: reachable } : {}) };
+  return {
+    State: code === "ready" ? "ready" : code === "dependency_not_installed" ? "not_installed" : "unavailable",
+    Code: code, Summary: summary, Component: "Hermes", Facts,
+    ...(detail ? { Detail: detail } : {}), ...(actions ? { Actions: actions } : {}),
+  };
+}
+
 async function hermesDesktopAvailability() {
+  const report = (code, summary, reason, actions, reachable) => ({
+    available: code === "ready", reason,
+    diagnostics: hermesDiagnostic(code, summary, "cdp", reason, actions, reachable),
+  });
   const bin = await resolveHermesBin();
   if (!(Boolean(bin) || fs.existsSync(HERMES_APP) || fs.existsSync(hermesAppPath()))) {
-    return { available: false, reason: "找不到 Hermes；请检查安装位置或设置 HERMES_BIN。" };
+    return report("dependency_not_installed", "未找到 Hermes", "请检查安装位置或 HERMES_BIN 配置。", ["open_download", "locate_agent", "recheck"]);
   }
   if (!fs.existsSync(SESSION_DB)) {
-    return { available: false, reason: "找不到 Hermes 会话数据库；请检查 HERMES_HOME。" };
+    return report("state_unavailable", "找不到 Hermes 会话数据库", "找不到 Hermes 会话数据库；请检查 HERMES_HOME。", ["recheck"]);
   }
   if (process.platform === "win32") {
     try { await queryJSON("SELECT 1 AS ready"); }
-    catch { return { available: false, reason: "无法读取 Hermes 会话数据库；请检查 HERMES_HOME 或重新安装插件。" }; }
+    catch { return report("state_unavailable", "无法读取 Hermes 会话数据库", "无法读取 Hermes 会话数据库；请检查 HERMES_HOME。", ["recheck"]); }
   }
   try {
     await cdpController.desktopSessionDirectoryIDs();
-    return { available: true, reason: "" };
+    return report("ready", "Hermes 已连接", "", undefined, true);
   } catch {
-    return { available: false, reason: "无法连接 Hermes Desktop；请启动桌面应用。" };
+    return report("desktop_control_unavailable", "Hermes 桌面控制不可用", "无法连接 Hermes Desktop；请检查应用和控制页面。", ["managed_relaunch", "recheck"]);
   }
 }
 
@@ -3434,7 +3447,7 @@ const desktopAdapter = {
   },
   async probe() {
     const status = await hermesDesktopAvailability();
-    return { ...capability(status.available), UnavailableReason: status.reason };
+    return { ...capability(status.available), UnavailableReason: status.reason, Diagnostics: status.diagnostics };
   },
   discover: discovery,
   startSessionWithMessage,
@@ -3829,18 +3842,35 @@ async function* subscribeNativePlugin(signal) {
 const nativeAdapter = {
   id() { return "hermes"; },
   async probe() {
-    try {
-      await nativeGatewayRuntime().connection();
-      await hermesGateway().ensureReady();
-      if (process.platform === "win32" && fs.existsSync(SESSION_DB)) await queryJSON("SELECT 1 AS ready");
-      return { ...capability(true), NativeVisibleInput: false, NativeVisibleOutput: false, CanOpenManagedTerminal: true, VisibilitySurface: "hermes-native-gateway" };
+    const base = {
+      NativeVisibleInput: false, NativeVisibleOutput: false, VisibilitySurface: "hermes-native-gateway",
+    };
+    const report = (code, summary, detail, actions, reachable) => {
+      const available = code === "ready";
+      return {
+        ...capability(available), ...base, CanOpenManagedTerminal: available,
+        UnavailableReason: available ? "" : detail || summary,
+        Diagnostics: hermesDiagnostic(code, summary, "websocket", detail, actions, reachable),
+      };
+    };
+    if (!await resolveHermesBin()) {
+      return report("dependency_not_installed", "未找到 Hermes CLI", "请检查安装位置或 HERMES_BIN 配置。", ["open_download", "locate_agent", "recheck"]);
     }
-    catch (error) {
-      const reason = process.platform === "win32"
-        ? "Hermes Native 未就绪；请检查 HERMES_BIN、HERMES_HOME 和插件安装。"
-        : firstNonEmpty(error && error.message, "hermes_native_gateway_unavailable");
-      return { ...capability(false), NativeVisibleInput: false, NativeVisibleOutput: false, VisibilitySurface: "hermes-native-gateway", UnavailableReason: reason };
+    try { await nativeGatewayRuntime().connection(); }
+    catch {
+      return report("control_channel_unreachable", "Hermes Gateway 未就绪", "托管 Gateway 未能启动或尚未监听。", ["managed_relaunch", "recheck"], false);
     }
+    try { await hermesGateway().ensureReady(); }
+    catch {
+      return report("gateway_handshake_failed", "Hermes Gateway 握手失败", "无法完成 Gateway 协议初始化。", ["recheck"]);
+    }
+    if (process.platform === "win32" && fs.existsSync(SESSION_DB)) {
+      try { await queryJSON("SELECT 1 AS ready"); }
+      catch {
+        return report("state_unavailable", "无法读取 Hermes 会话数据库", "请检查 HERMES_HOME 和会话数据库权限。", ["recheck"], true);
+      }
+    }
+    return report("ready", "Hermes 已连接", "", undefined, true);
   },
   discover: nativeDiscovery,
   startSessionWithMessage: nativeStartSessionWithMessage,
@@ -3870,7 +3900,10 @@ function unavailableAdapter(reason) {
   const fail = async () => { throw new Error(reason); };
   return {
     id() { return "hermes"; },
-    async probe() { return { ...capability(false), UnavailableReason: reason }; },
+    async probe() {
+      const diagnostics = hermesDiagnostic("unsupported_runtime_mode", "Hermes 运行模式不受支持", "unknown", undefined, ["recheck"]);
+      return { ...capability(false), UnavailableReason: diagnostics.Summary, Diagnostics: diagnostics };
+    },
     async discover() { return { PluginID: "hermes", Surface: "hermes", Endpoint: "", ProcessID: 0, SessionHints: {}, Verified: false, Detail: reason }; },
     startSessionWithMessage: fail,
     listSessions: fail,

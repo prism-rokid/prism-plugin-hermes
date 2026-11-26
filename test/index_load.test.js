@@ -26,3 +26,31 @@ test("index.js loads without undefined references", async () => {
     child.stderr?.resume();
   });
 });
+
+test("Hermes Native 缺少 CLI 时通过 stdio 返回结构化诊断", () => {
+  const assert = require("node:assert/strict");
+  const { spawnSync } = require("node:child_process");
+  const entry = path.join(__dirname, "..", "index.js");
+  const isolatedProbe = `
+const fs = require("node:fs");
+const path = require("node:path");
+const exists = fs.existsSync;
+fs.existsSync = value => {
+  const name = path.win32.basename(String(value)).toLowerCase();
+  return name === "hermes" || name === "hermes.exe" ? false : exists(value);
+};
+require(${JSON.stringify(entry)});
+`;
+  const result = spawnSync(process.execPath, ["-e", isolatedProbe], {
+    input: JSON.stringify({ id: "probe", method: "adapter.probe" }) + "\n",
+    env: { ...process.env, PATH: "", PRISM_PLUGIN_MODE: "native", HERMES_BIN: path.join(__dirname, "不存在的-hermes") },
+    encoding: "utf8",
+    timeout: 15000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const { payload } = JSON.parse(result.stdout.trim());
+  assert.equal(payload.available, false);
+  assert.equal(payload.diagnostics.code, "dependency_not_installed");
+  assert.equal(payload.diagnostics.facts.transport, "websocket");
+  assert.ok(payload.unavailable_reason);
+});
